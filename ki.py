@@ -1,74 +1,148 @@
 import streamlit as st
 import cv2
-import numpy as np
 from ultralytics import YOLO
-import supervision as sv
+import tempfile
+import os
+import time
 
-st.title("🚗 Traffic Analysis mit YOLO")
+# ====================== KONFIG ======================
+st.set_page_config(page_title="🚦 Stau-Detektor", page_icon="🚦", layout="wide")
 
-# Modell laden (wird nur einmal geladen)
+st.title("🚦 KI-Verkehrsanalyse mit YOLOv8")
+st.markdown("""
+**Upload ein Verkehrs-Video** → YOLO erkennt Fahrzeuge → App sagt dir, ob **Stau** herrscht.
+""")
+
+# Modell laden (wird nur einmal gecacht)
 @st.cache_resource
-def load_model():
-    return YOLO("yolov8n.pt")
+def load_model(model_size: str = "n"):
+    return YOLO(f"yolov8{model_size}.pt")  # n = schnell, s/m/l = genauer
 
-model = load_model()
+# ====================== SIDEBAR ======================
+with st.sidebar:
+    st.header("⚙️ Einstellungen")
+    
+    model_size = st.selectbox(
+        "YOLO-Modellgröße",
+        options=["n", "s", "m"],
+        index=0,
+        help="n = sehr schnell (gut für Tests), s/m = besser bei dichtem Verkehr"
+    )
+    
+    conf_threshold = st.slider("Konfidenzschwelle", 0.25, 0.95, 0.45, 0.05)
+    
+    stau_threshold = st.slider(
+        "Stau-Schwellenwert (Fahrzeuge pro Frame)",
+        min_value=2,
+        max_value=25,
+        value=8,
+        help="Hängt von der Kameraperspektive ab. Bei normalen Straßen meist 6–12."
+    )
+    
+    model = load_model(model_size)
 
-# Video Upload
-video_file = st.file_uploader("Video hochladen", type=["mp4", "avi", "mov"])
+# ====================== HAUPTBEREICH ======================
+uploaded_file = st.file_uploader(
+    "📤 Verkehrs-Video hochladen (mp4, avi, mov)",
+    type=["mp4", "avi", "mov"],
+    help="Max. 100–200 MB empfohlen, sonst wird es langsam"
+)
 
-if video_file is not None:
-    # Video speichern
-    with open("temp_video.mp4", "wb") as f:
-        f.write(video_file.read())
+if uploaded_file is not None:
+    # Temporäre Datei speichern
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tfile:
+        tfile.write(uploaded_file.getvalue())
+        video_path = tfile.name
 
-    cap = cv2.VideoCapture("temp_video.mp4")
+    st.success("✅ Video hochgeladen – wird jetzt analysiert...")
 
-    tracker = sv.ByteTrack()
+    # Video verarbeiten
+    cap = cv2.VideoCapture(video_path)
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    line_start = (100, 300)
+    # Output-Video vorbereiten
+    out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
 
-    vehicle_times = {}
+    vehicle_classes = [2, 3, 5, 7]  # COCO: car, motorcycle, bus, truck
+    frame_count = 0
+    total_vehicles = 0
+    max_vehicles_per_frame = 0
 
-    frame_placeholder = st.empty()
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    stframe = st.empty()  # Live-Vorschau
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame = cv2.resize(frame, (1280, 720))
+        frame_count += 1
 
-        results = model(frame)[0]
-        detections = sv.Detections.from_ultralytics(results)
+        # YOLO Detection
+        results = model(frame, conf=conf_threshold, verbose=False)
 
-        vehicle_classes = [2, 3, 5, 7]
-        mask = np.isin(detections.class_id, vehicle_classes)
-        detections = detections[mask]
+        # Nur Fahrzeuge zählen
+        vehicles_in_frame = sum(
+            1 for box in results[0].boxes
+            if int(box.cls) in vehicle_classes
+        )
+        total_vehicles += vehicles_in_frame
+        max_vehicles_per_frame = max(max_vehicles_per_frame, vehicles_in_frame)
 
-        detections = tracker.update_with_detections(detections)
+        # Frame annotieren
+        annotated_frame = results[0].plot()
 
-        for xyxy, track_id in zip(detections.xyxy, detections.tracker_id):
-            x1, y1, x2, y2 = map(int, xyxy)
-            center_y = (y1 + y2) // 2
+        # Video schreiben
+        out.write(annotated_frame)
 
-            if abs(center_y - line_start[1]) < 5:
-                if track_id not in vehicle_times:
-                    vehicle_times[track_id] = cv2.getTickCount()
-                else:
-                    time_diff = (cv2.getTickCount() - vehicle_times[track_id]) / cv2.getTickFrequency()
-                    distance = 10
-                    speed = distance / time_diff * 3.6
+        # Live-Vorschau (jeden 5. Frame)
+        if frame_count % 5 == 0:
+            stframe.image(annotated_frame, channels="BGR", use_column_width=True)
 
-                    st.write(f"🚗 Fahrzeug {track_id}: {speed:.2f} km/h")
-
-        # Zeichnen
-        cv2.line(frame, line_start, (800, 300), (0, 255, 0), 2)
-
-        for xyxy in detections.xyxy:
-            x1, y1, x2, y2 = map(int, xyxy)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-        # Anzeige in Streamlit (statt imshow!)
-        frame_placeholder.image(frame, channels="BGR")
+        # Fortschritt
+        progress = min(frame_count / total_frames, 1.0)
+        progress_bar.progress(progress)
+        status_text.text(f"Verarbeite Frame {frame_count}/{total_frames} – Fahrzeuge: {vehicles_in_frame}")
 
     cap.release()
+    out.release()
+
+    # ====================== ERGEBNIS ======================
+    avg_vehicles = total_vehicles / frame_count if frame_count > 0 else 0
+
+    st.subheader("📊 Analyse-Ergebnis")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Durchschnittliche Fahrzeuge pro Frame", f"{avg_vehicles:.1f}")
+    with col2:
+        st.metric("Max. Fahrzeuge in einem Frame", max_vehicles_per_frame)
+    with col3:
+        st.metric("Gesamte Frames analysiert", frame_count)
+
+    # Stau-Entscheidung
+    if avg_vehicles >= stau_threshold:
+        st.error("🚨 **STAU erkannt!**")
+        st.balloons()  # kleine Spaß-Einlage 😄
+    else:
+        st.success("✅ **Flüssiger Verkehr** – alles im grünen Bereich")
+
+    # Verarbeitetes Video abspielen
+    st.video(out_path)
+
+    # Aufräumen
+    os.unlink(video_path)
+    os.unlink(out_path)
+
+    st.info("Tipp: Passe den **Stau-Schwellenwert** in der Sidebar an deine Kameraperspektive an.")
+
+else:
+    st.info("👆 Lade ein Video hoch, um zu starten.")
+
+st.caption("🚀 Basis-App von Grok – bereit für Erweiterungen (Live-Webcam, RTSP, ByteTrack + Geschwindigkeit, Custom YOLO-Modell...)")
